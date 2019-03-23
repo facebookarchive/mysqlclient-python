@@ -2,6 +2,7 @@
 
 This module implements Cursors of various types for MySQLdb. By
 default, MySQLdb uses the Cursor class.
+
 """
 from __future__ import print_function, absolute_import
 from functools import partial
@@ -13,6 +14,8 @@ from ._exceptions import (
     Warning, Error, InterfaceError, DataError,
     DatabaseError, OperationalError, IntegrityError, InternalError,
     NotSupportedError, ProgrammingError)
+
+from .constants import ASYNC
 
 
 #: Regular expression for :meth:`Cursor.executemany`.
@@ -26,6 +29,7 @@ RE_INSERT_VALUES = re.compile(
 
 
 class BaseCursor(object):
+
     """A base for Cursor classes. Useful attributes:
 
     description
@@ -40,8 +44,8 @@ class BaseCursor(object):
 
     arraysize
         default number of rows fetchmany() will fetch
-    """
 
+    """
     #: Max stetement size which :meth:`executemany` generates.
     #:
     #: Max size of allowed statement is max_allowed_packet - packet_header_size.
@@ -55,6 +59,7 @@ class BaseCursor(object):
     )
 
     connection = None
+
 
     def __init__(self, connection):
         self.connection = connection
@@ -77,11 +82,12 @@ class BaseCursor(object):
         self._warnings = None
         self.rownumber = None
         self._rows = None
+        self.query_attributes = {}
 
     def close(self):
         """Close the cursor. No further queries will be possible."""
         try:
-            if self.connection is None:
+            if self.connection is None or not self.connection.open:
                 return
             while self.nextset():
                 pass
@@ -122,6 +128,7 @@ class BaseCursor(object):
     def _check_executed(self):
         if not self._executed:
             raise ProgrammingError("execute() first")
+
 
     def nextset(self):
         """Advance to the next result set.
@@ -167,6 +174,12 @@ class BaseCursor(object):
         if con is None:
             raise ProgrammingError("cursor closed")
         return con
+
+    def get_query_attributes(self):
+        return self.query_attributes.copy()
+
+    def set_query_attributes(self, query_attributes):
+        self.query_attributes = query_attributes.copy()
 
     def execute(self, query, args=None):
         """Execute a query.
@@ -309,7 +322,7 @@ class BaseCursor(object):
     def _query(self, q):
         db = self._get_db()
         self._result = None
-        db.query(q)
+        db.query(q, self.query_attributes)
         self._do_get_result(db)
         self._post_get_result()
         self._executed = q
@@ -450,6 +463,7 @@ class CursorUseResultMixIn(object):
 
 
 class CursorTupleRowsMixIn(object):
+
     """This is a MixIn class that causes all rows to be returned as tuples,
     which is the standard form required by DB API."""
 
@@ -457,6 +471,7 @@ class CursorTupleRowsMixIn(object):
 
 
 class CursorDictRowsMixIn(object):
+
     """This is a MixIn class that causes all rows to be returned as
     dictionaries. This is a non-standard feature."""
 
@@ -465,23 +480,104 @@ class CursorDictRowsMixIn(object):
 
 class Cursor(CursorStoreResultMixIn, CursorTupleRowsMixIn,
              BaseCursor):
+
     """This is the standard Cursor class that returns rows as tuples
     and stores the result set in the client."""
 
 
 class DictCursor(CursorStoreResultMixIn, CursorDictRowsMixIn,
                  BaseCursor):
-    """This is a Cursor class that returns rows as dictionaries and
+
+     """This is a Cursor class that returns rows as dictionaries and
     stores the result set in the client."""
 
 
 class SSCursor(CursorUseResultMixIn, CursorTupleRowsMixIn,
                BaseCursor):
+
     """This is a Cursor class that returns rows as tuples and stores
     the result set in the server."""
 
 
 class SSDictCursor(CursorUseResultMixIn, CursorDictRowsMixIn,
                    BaseCursor):
+
     """This is a Cursor class that returns rows as dictionaries and
     stores the result set in the server."""
+
+
+class NonblockingCursorResultMixIn(object):
+
+    """This is a MixIn class which causes the result set to be retrieved
+    nonblocking in the server and sent row-by-row to client side.  You
+    MUST retrieve the entire result set and close() the cursor before
+    additional queries can be peformed on the connection."""
+
+    def _get_result(self):
+        return self._get_db().use_result()
+
+    def _query(self, q):
+        db = self._get_db()
+        self._result = None
+        if isinstance(q, bytearray):
+            q = bytes(q)
+        self._last_executed = q
+        return db.query_nonblocking(self._last_executed)
+
+    def fetchone_nonblocking(self):
+        if not self._result:
+            return ()
+        return self._result.fetch_row_nonblocking(self._fetch_type)
+
+    def execute_nonblocking(self):
+        db = self._get_db()
+        status = db.query_nonblocking(self._last_executed)
+        if status == ASYNC.NET_ASYNC_COMPLETE:
+            self._do_get_result(db)
+            self._post_get_result()
+            self._executed = self._last_executed
+
+        return status
+
+    def close(self):
+        """Close the cursor. No further queries will be possible."""
+        if not self.connection:
+            return
+        self.connection = None
+        self._last_executed = None
+        self._result = None
+
+    def nextset(self):
+        return None
+
+    def fetchone(self):
+        raise NotImplementedError("blocking fetchone not available for nonblocking cursor")
+
+    def fetchmany(self, size=None):
+        raise NotImplementedError("blocking fetchmany not available for nonblocking cursor")
+
+    def fetchall(self):
+        raise NotImplementedError("blocking fetchall not available for nonblocking cursor")
+
+    def __iter__(self):
+        raise NotImplementedError("blocking iterator fetch not available for nonblocking cursor")
+
+
+class NBCursor(NonblockingCursorResultMixIn, CursorTupleRowsMixIn,
+               BaseCursor):
+
+    """This is a nonblocking Cursor class that returns rows as tuples and
+    stores the result set in the server."""
+
+    def set_result(self, result):
+        self._result = result
+
+
+class NBDictCursor(NonblockingCursorResultMixIn, CursorDictRowsMixIn,
+                   BaseCursor):
+
+    """This is a nonblocking Cursor class that returns rows as
+    dictionaries and stores the result set in the server."""
+
+
+

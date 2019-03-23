@@ -1,14 +1,17 @@
 """
+
 This module implements connections for MySQLdb. Presently there is
 only one class: Connection. Others are unlikely. However, you might
 want to make your own subclasses. In most cases, you will probably
 override Connection.default_cursor with a non-standard Cursor class.
+
 """
 import re
 import sys
 
 from MySQLdb import cursors, _mysql
 from MySQLdb.compat import unicode, PY2
+from MySQLdb.constants import ASYNC
 from MySQLdb._exceptions import (
     Warning, Error, InterfaceError, DataError,
     DatabaseError, OperationalError, IntegrityError, InternalError,
@@ -35,6 +38,7 @@ def numeric_part(s):
 
 
 class Connection(_mysql.connection):
+
     """MySQL Database Connection Object"""
 
     default_cursor = cursors.Cursor
@@ -73,23 +77,21 @@ class Connection(_mysql.connection):
 
         :param bool use_unicode:
             If True, text-like columns are returned as unicode objects
-            using the connection's character set. Otherwise, text-like
-            columns are returned as bytes. Unicode objects will always
-            be encoded to the connection's character set regardless of
-            this setting.
-            Default to False on Python 2 and True on Python 3
-            so that you can always get python `str` object by default.
+            using the connection's character set.  Otherwise, text-like
+            columns are returned as strings.  columns are returned as
+            normal strings. Unicode objects will always be encoded to
+            the connection's character set regardless of this setting.
+            Default to False on Python 2 and True on Python 3.
 
         :param str charset:
             If supplied, the connection character set will be changed
-            to this character set.
-            On Python 2, this option changes default value of `use_unicode`
-            option from False to True.
+            to this character set (MySQL-4.1 and newer). This implies
+            use_unicode=True.
 
         :param str sql_mode:
             If supplied, the session SQL mode will be changed to this
-            setting.
-            For more details and legal values, see the MySQL documentation.
+            setting (MySQL-4.1 and newer). For more details and legal
+            values, see the MySQL documentation.
 
         :param int client_flag:
             flags to use or 0 (see MySQL docs or constants/CLIENTS.py)
@@ -111,6 +113,11 @@ class Connection(_mysql.connection):
         :param bool binary_prefix:
             If set, the '_binary' prefix will be used for raw byte query
             arguments (e.g. Binary). This is disabled by default.
+
+        :param bool latin1_as_utf8
+            Defaults to true, and is used to trigger latin1 but really utf8 hack.
+            Fields have charset latin1, but have historically been used to
+            store utf-8 data.
 
         There are a number of undocumented, non-standard methods. See the
         documentation for the MySQL C API for some hints on what they do.
@@ -175,6 +182,37 @@ class Connection(_mysql.connection):
         # See PyMySQL/mysqlclient-python#306
         self.encoders[bytes] = bytes
 
+        # fb nonblocking post_connect_init setup.
+        # All done here to make merges easier with upstream
+        # The upstream __init__ continues in _post_connect_init()
+        self._charset = charset
+        self._use_unicode = use_unicode
+        self._autocommit = autocommit
+        self._sql_mode = sql_mode
+        self._nonblocking = kwargs2.get("nonblocking", False)
+        self._latin1_as_utf8 = kwargs2.get("latin1_as_utf8", True)
+        if not self._nonblocking:
+            self._post_connect_init()
+
+    def nonblocking_connect_run(self):
+        ret = super(Connection, self).nonblocking_connect_run()
+        if ret == ASYNC.NET_ASYNC_COMPLETE:
+            self._post_connect_init()
+        return ret
+
+    def _post_connect_init(self):
+        """Perform post-connection initialization; in non-blocking mode, some
+        settings are omitted such as sql_mode and autocommit."""
+        from MySQLdb.constants import CLIENT, FIELD_TYPE
+        from MySQLdb.converters import conversions, _bytes_or_str
+        from weakref import proxy
+        # unpacked for easy merges
+        autocommit = self._autocommit
+        charset = self._charset
+        sql_mode = self._sql_mode
+        use_unicode = self._use_unicode
+        # continuation of __init__
+
         self._server_version = tuple([ numeric_part(n) for n in self.get_server_info().split('.')[:2] ])
 
         self.encoding = 'ascii'  # overridden in set_character_set()
@@ -188,7 +226,8 @@ class Connection(_mysql.connection):
         self.set_character_set(charset)
 
         if sql_mode:
-            self.set_sql_mode(sql_mode)
+            if not self._nonblocking:
+                self.set_sql_mode(sql_mode)
 
         if use_unicode:
             for t in (FIELD_TYPE.STRING, FIELD_TYPE.VAR_STRING, FIELD_TYPE.VARCHAR, FIELD_TYPE.TINY_BLOB,
@@ -202,7 +241,8 @@ class Connection(_mysql.connection):
         self._transactional = self.server_capabilities & CLIENT.TRANSACTIONS
         if self._transactional:
             if autocommit is not None:
-                self.autocommit(autocommit)
+                if not self._nonblocking:
+                    self.autocommit(autocommit)
         self.messages = []
 
     def autocommit(self, on):
@@ -212,18 +252,20 @@ class Connection(_mysql.connection):
 
     def cursor(self, cursorclass=None):
         """
+
         Create a cursor on which queries may be performed. The
         optional cursorclass parameter is used to create the
         Cursor. By default, self.cursorclass=cursors.Cursor is
         used.
+
         """
         return (cursorclass or self.cursorclass)(self)
 
-    def query(self, query):
+    def query(self, query, query_attributes=None):
         # Since _mysql releases GIL while querying, we need immutable buffer.
         if isinstance(query, bytearray):
             query = bytes(query)
-        _mysql.connection.query(self, query)
+        _mysql.connection.query(self, query, query_attributes)
 
     def _bytes_literal(self, bs):
         assert isinstance(bs, (bytes, bytearray))
@@ -235,11 +277,21 @@ class Connection(_mysql.connection):
     def _tuple_literal(self, t):
         return b"(%s)" % (b','.join(map(self.literal, t)))
 
+    def __enter__(self):
+        if self.get_autocommit():
+            self.query(b"BEGIN")
+        return self.cursor()
+
+    def __exit__(self, exc, value, tb):
+        if exc:
+            self.rollback()
+        else:
+            self.commit()
+
     def literal(self, o):
         """If o is a single object, returns an SQL literal as a string.
         If o is a non-string sequence, the items of the sequence are
         converted and returned as a sequence.
-
         Non-standard. For internal use; do not use this in your
         applications.
         """
@@ -284,7 +336,9 @@ class Connection(_mysql.connection):
         set can only be changed in MySQL-4.1 and newer. If you try
         to change the character set from the current value in an
         older version, NotSupportedError will be raised."""
-        if charset in ("utf8mb4", "utf8mb3"):
+        if self._latin1_as_utf8 and charset == "latin1":
+            py_charset = "utf8"  # fb hack latin1 is never latin1
+        elif charset in ("utf8mb4", "utf8mb3"):
             py_charset = "utf8"
         else:
             py_charset = charset
@@ -317,6 +371,7 @@ class Connection(_mysql.connection):
         warnings = r.fetch_row(0)
         return warnings
 
+
     Warning = Warning
     Error = Error
     InterfaceError = InterfaceError
@@ -327,5 +382,3 @@ class Connection(_mysql.connection):
     InternalError = InternalError
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
-
-# vim: colorcolumn=100

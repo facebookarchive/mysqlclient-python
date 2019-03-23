@@ -114,6 +114,7 @@ conversions = {
     FIELD_TYPE.DATETIME: DateTime_or_None,
     FIELD_TYPE.TIME: TimeDelta_or_None,
     FIELD_TYPE.DATE: Date_or_None,
+    FIELD_TYPE.NEWDATE: Date_or_None,
 
     FIELD_TYPE.TINY_BLOB: bytes,
     FIELD_TYPE.MEDIUM_BLOB: bytes,
